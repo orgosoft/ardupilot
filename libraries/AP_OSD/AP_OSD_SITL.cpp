@@ -23,6 +23,7 @@
 #ifdef WITH_SITL_OSD
 
 #include "AP_OSD_SITL.h"
+#include <AP_Common/Semaphore.h>
 #include <AP_HAL/Util.h>
 #include <AP_HAL/Semaphores.h>
 #include <AP_HAL/Scheduler.h>
@@ -42,7 +43,15 @@ extern const AP_HAL::HAL &hal;
 void AP_OSD_SITL::load_font(void)
 {
     uint32_t font_size;
-    const uint8_t *font_data = AP_ROMFS::find_file("osd_font.bin", font_size);
+    char fontname[] = "font0.bin";
+    last_font = get_font_num();
+    fontname[4] = last_font + '0';
+    uint8_t *font_data = AP_ROMFS::find_decompress(fontname, font_size);
+    if (font_data == nullptr && last_font != 0) {
+        last_font = 0;
+        fontname[4] = last_font + '0';
+        font_data = AP_ROMFS::find_decompress(fontname, font_size);
+    }
     if (font_data == nullptr || font_size != 54 * 256) {
         AP_HAL::panic("Bad font file");
     }
@@ -82,33 +91,33 @@ void AP_OSD_SITL::load_font(void)
                     p[3] = 255;
                     break;
                 }
-                    
+
             }
         }
         font[i].update(pixels);
     }
+    free(font_data);
 }
 
-void AP_OSD_SITL::write(uint8_t x, uint8_t y, const char* text, uint8_t char_attr)
+void AP_OSD_SITL::write(uint8_t x, uint8_t y, const char* text)
 {
     if (y >= video_lines || text == nullptr) {
         return;
     }
-    mutex->take_blocking();
+    WITH_SEMAPHORE(mutex);
+
     while ((x < video_cols) && (*text != 0)) {
         buffer[y][x] = *text;
-        attr[y][x] = char_attr;
         ++text;
         ++x;
     }
-    mutex->give();
 }
 
 void AP_OSD_SITL::clear(void)
 {
-    mutex->take_blocking();
+    AP_OSD_Backend::clear();
+    WITH_SEMAPHORE(mutex);
     memset(buffer, 0, sizeof(buffer));
-    mutex->give();
 }
 
 void AP_OSD_SITL::flush(void)
@@ -127,26 +136,24 @@ void AP_OSD_SITL::update_thread(void)
         AP_HAL::panic("Unable to create OSD window");
     }
 
-    uint8_t blink = 0;
-    while (w->isOpen())
-    {
+    while (w->isOpen()) {
         sf::Event event;
-        while (w->pollEvent(event))
-        {
-            if (event.type == sf::Event::Closed)
+        while (w->pollEvent(event)) {
+            if (event.type == sf::Event::Closed) {
                 w->close();
+            }
         }
         if (counter == last_counter) {
+            usleep(10000);
             continue;
         }
         last_counter = counter;
 
         uint8_t buffer2[video_lines][video_cols];
-        uint8_t attr2[video_lines][video_cols];
-        mutex->take_blocking();
-        memcpy(buffer2, buffer, sizeof(buffer2));
-        memcpy(attr2, attr, sizeof(attr2));
-        mutex->give();
+        {
+            WITH_SEMAPHORE(mutex);
+            memcpy(buffer2, buffer, sizeof(buffer2));
+        }
         w->clear();
 
         for (uint8_t y=0; y<video_lines; y++) {
@@ -155,20 +162,17 @@ void AP_OSD_SITL::update_thread(void)
                 uint16_t py = y * (char_height+char_spacing) * char_scale;
                 sf::Sprite s;
                 uint8_t c = buffer2[y][x];
-                if (attr2[y][x] & BLINK) {
-                    if (blink >= 2) {
-                        c = ' ';
-                    }
-                }
                 s.setTexture(font[c]);
                 s.setPosition(sf::Vector2f(px, py));
                 s.scale(sf::Vector2f(char_scale,char_scale));
                 w->draw(s);
             }
         }
-        
-        blink = (blink+1) % 4;
+
         w->display();
+        if (last_font != get_font_num()) {
+            load_font();
+        }
         usleep(10000);
     }
 }
@@ -183,7 +187,6 @@ void *AP_OSD_SITL::update_thread_start(void *obj)
 // initialise backend
 bool AP_OSD_SITL::init(void)
 {
-    mutex = hal.util->new_semaphore();
     pthread_create(&thread, NULL, update_thread_start, this);
     return true;
 }

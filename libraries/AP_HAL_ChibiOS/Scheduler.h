@@ -23,13 +23,13 @@
 #define CHIBIOS_SCHEDULER_MAX_TIMER_PROCS 8
 
 #define APM_MAIN_PRIORITY       180
-#define APM_TIMER_PRIORITY      178
+#define APM_TIMER_PRIORITY      181
 #define APM_RCIN_PRIORITY       177
-#define APM_TONEALARM_PRIORITY   61
 #define APM_UART_PRIORITY        60
 #define APM_STORAGE_PRIORITY     59
 #define APM_IO_PRIORITY          58
 #define APM_STARTUP_PRIORITY     10
+#define APM_SCRIPTING_PRIORITY  LOWPRIO
 
 /*
   boost priority handling
@@ -44,19 +44,30 @@
 #define APM_SPI_PRIORITY        181
 #endif
 
-#ifndef APM_UAVCAN_PRIORITY
-#define APM_UAVCAN_PRIORITY     178
-#endif
-
 #ifndef APM_CAN_PRIORITY
-#define APM_CAN_PRIORITY        177
+#define APM_CAN_PRIORITY        178
 #endif
 
 #ifndef APM_I2C_PRIORITY
 #define APM_I2C_PRIORITY        176
 #endif
 
-#define APM_MAIN_THREAD_STACK_SIZE 8192
+#ifndef TIMER_THD_WA_SIZE
+#define TIMER_THD_WA_SIZE   2048
+#endif
+
+#ifndef RCIN_THD_WA_SIZE
+#define RCIN_THD_WA_SIZE    512
+#endif
+
+#ifndef IO_THD_WA_SIZE
+#define IO_THD_WA_SIZE      2048
+#endif
+
+#ifndef STORAGE_THD_WA_SIZE
+#define STORAGE_THD_WA_SIZE 2048
+#endif
+
 
 /* Scheduler implementation: */
 class ChibiOS::Scheduler : public AP_HAL::Scheduler {
@@ -65,7 +76,7 @@ public:
     /* AP_HAL::Scheduler methods */
 
 
-    void     init();
+    void     init() override;
     void     delay(uint16_t ms) override;
     void     delay_microseconds(uint16_t us) override;
     void     delay_microseconds_boost(uint16_t us) override;
@@ -76,11 +87,19 @@ public:
     void     reboot(bool hold_in_bootloader) override;
 
     bool     in_main_thread() const override;
-    void     system_initialized();
+    void     system_initialized() override;
     void     hal_initialized() { _hal_initialized = true; }
 
     bool     check_called_boost(void);
 
+    /*
+      inform the scheduler that we are calling an operation from the
+      main thread that may take an extended amount of time. This can
+      be used to prevent watchdog reset during expected long delays
+      A value of zero cancels the previous expected delay
+     */
+    void     expect_delay_ms(uint32_t ms) override;
+    
     /*
       disable interrupts and return a context that can be used to
       restore the interrupt state. This can be used to protect
@@ -92,14 +111,20 @@ public:
       restore interrupt state from disable_interrupts_save()
      */
     void restore_interrupts(void *) override;
-    
+
+    /*
+      create a new thread
+     */
+    bool thread_create(AP_HAL::MemberProc, const char *name, uint32_t stack_size, priority_base base, int8_t priority) override;
+
 private:
     bool _initialized;
     volatile bool _hal_initialized;
     AP_HAL::Proc _failsafe;
     bool _called_boost;
     bool _priority_boosted;
-    
+    uint32_t expect_delay_start;
+    uint32_t expect_delay_length;
 
     AP_HAL::MemberProc _timer_proc[CHIBIOS_SCHEDULER_MAX_TIMER_PROCS];
     uint8_t _num_timer_procs;
@@ -113,10 +138,7 @@ private:
     thread_t* _rcin_thread_ctx;
     thread_t* _io_thread_ctx;
     thread_t* _storage_thread_ctx;
-    thread_t* _toneAlarm_thread_ctx;
-#if HAL_WITH_UAVCAN
-    thread_t* _uavcan_thread_ctx;
-#endif
+
 #if CH_CFG_USE_SEMAPHORES == TRUE
     binary_semaphore_t _timer_semaphore;
     binary_semaphore_t _io_semaphore;
@@ -126,11 +148,9 @@ private:
     static void _io_thread(void *arg);
     static void _storage_thread(void *arg);
     static void _uart_thread(void *arg);
-    static void _toneAlarm_thread(void *arg);
-#if HAL_WITH_UAVCAN
-    static void _uavcan_thread(void *arg);
-#endif
+
     void _run_timers();
     void _run_io(void);
+    static void thread_create_trampoline(void *ctx);    
 };
 #endif

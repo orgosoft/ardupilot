@@ -25,8 +25,9 @@
 #include <AP_HAL/AP_HAL.h>
 #include <AP_HAL/Util.h>
 #include <RC_Channel/RC_Channel.h>
-
+#include <AP_AHRS/AP_AHRS.h>
 #include <utility>
+#include <AP_Notify/AP_Notify.h>
 
 const AP_Param::GroupInfo AP_OSD::var_info[] = {
 
@@ -73,10 +74,89 @@ const AP_Param::GroupInfo AP_OSD::var_info[] = {
     // @Param: _OPTIONS
     // @DisplayName: OSD Options
     // @Description: This sets options that change the display
-    // @Bitmask: 0:UseDecimalPack
+    // @Bitmask: 0:UseDecimalPack, 1:InvertedWindPointer, 2:InvertedAHRoll
     // @User: Standard
     AP_GROUPINFO("_OPTIONS", 8, AP_OSD, options, OPTION_DECIMAL_PACK),
+
+    // @Param: _FONT
+    // @DisplayName: OSD Font
+    // @Description: This sets which OSD font to use. It is an integer from 0 to the number of fonts available
+    // @User: Standard
+    // @RebootRequired: True
+    AP_GROUPINFO("_FONT", 9, AP_OSD, font_num, 0),
+
+    // @Param: _V_OFFSET
+    // @DisplayName: OSD vertical offset
+    // @Description: Sets vertical offset of the osd inside image
+    // @Range: 0 31
+    // @User: Standard
+    // @RebootRequired: True
+    AP_GROUPINFO("_V_OFFSET", 10, AP_OSD, v_offset, 16),
+
+    // @Param: _H_OFFSET
+    // @DisplayName: OSD horizontal offset
+    // @Description: Sets horizontal offset of the osd inside image
+    // @Range: 0 63
+    // @User: Standard
+    // @RebootRequired: True
+    AP_GROUPINFO("_H_OFFSET", 11, AP_OSD, h_offset, 32),
+
+    // @Param: _W_RSSI
+    // @DisplayName: RSSI warn level (in %)
+    // @Description: Set level at which RSSI item will flash
+    // @Range: 0 99
+    // @User: Standard
+    AP_GROUPINFO("_W_RSSI", 12, AP_OSD, warn_rssi, 30),
+
+    // @Param: _W_NSAT
+    // @DisplayName: NSAT warn level
+    // @Description: Set level at which NSAT item will flash
+    // @Range: 1 30
+    // @User: Standard
+    AP_GROUPINFO("_W_NSAT", 13, AP_OSD, warn_nsat, 9),
+
+    // @Param: _W_BATVOLT
+    // @DisplayName: BAT_VOLT warn level
+    // @Description: Set level at which BAT_VOLT item will flash
+    // @Range: 0 100
+    // @User: Standard
+    AP_GROUPINFO("_W_BATVOLT", 14, AP_OSD, warn_batvolt, 10.0f),
+
+    // @Param: _UNITS
+    // @DisplayName: Display Units
+    // @Description: Sets the units to use in displaying items
+    // @Values: 0:Metric,1:Imperial,2:SI,3:Aviation
+    // @User: Standard
+    AP_GROUPINFO("_UNITS", 15, AP_OSD, units, 0),
+
+    // @Param: _MSG_TIME
+    // @DisplayName: Message display duration in seconds
+    // @Description: Sets message duration seconds
+    // @Range: 1 20
+    // @User: Standard
+    AP_GROUPINFO("_MSG_TIME", 16, AP_OSD, msgtime_s, 10),
     
+    // @Param: _ARM_SCR
+    // @DisplayName: Arm screen
+    // @Description: Screen to be shown on Arm event. Zero to disable the feature.
+    // @Range: 0 4
+    // @User: Standard
+    AP_GROUPINFO("_ARM_SCR", 17, AP_OSD, arm_scr, 0),
+    
+    // @Param: _DSARM_SCR
+    // @DisplayName: Disarm screen
+    // @Description: Screen to be shown on disarm event. Zero to disable the feature.
+    // @Range: 0 4
+    // @User: Standard
+    AP_GROUPINFO("_DSARM_SCR", 18, AP_OSD, disarm_scr, 0),
+
+    // @Param: _FS_SCR
+    // @DisplayName: Failsafe screen
+    // @Description: Screen to be shown on failsafe event. Zero to disable the feature.
+    // @Range: 0 4
+    // @User: Standard
+    AP_GROUPINFO("_FS_SCR", 19, AP_OSD, failsafe_scr, 0),
+
     AP_GROUPEND
 };
 
@@ -87,6 +167,14 @@ AP_OSD::AP_OSD()
     AP_Param::setup_object_defaults(this, var_info);
     // default first screen enabled
     screen[0].enabled = 1;
+#ifdef WITH_SITL_OSD
+    osd_type.set_default(2);
+#endif
+    
+#ifdef HAL_OSD_TYPE_DEFAULT
+    osd_type.set_default(HAL_OSD_TYPE_DEFAULT);
+#endif
+    previous_pwm_screen = -1;
 }
 
 void AP_OSD::init()
@@ -106,7 +194,6 @@ void AP_OSD::init()
             break;
         }
         hal.console->printf("Started MAX7456 OSD\n");
-        hal.scheduler->register_io_process(FUNCTOR_BIND_MEMBER(&AP_OSD::timer, void));
         break;
     }
 
@@ -117,19 +204,20 @@ void AP_OSD::init()
             break;
         }
         hal.console->printf("Started SITL OSD\n");
-        hal.scheduler->register_io_process(FUNCTOR_BIND_MEMBER(&AP_OSD::timer, void));
         break;
     }
 #endif
     }
+    if (backend != nullptr) {
+        // create thread as higher priority than IO
+        hal.scheduler->thread_create(FUNCTOR_BIND_MEMBER(&AP_OSD::osd_thread, void), "OSD", 1024, AP_HAL::Scheduler::PRIORITY_IO, 1);
+    }
 }
 
-void AP_OSD::timer()
+void AP_OSD::osd_thread()
 {
-    uint32_t now = AP_HAL::millis();
-
-    if (now - last_update_ms >= 100) {
-        last_update_ms = now;
+    while (true) {
+        hal.scheduler->delay(100);
         update_osd();
     }
 }
@@ -137,7 +225,7 @@ void AP_OSD::timer()
 void AP_OSD::update_osd()
 {
     backend->clear();
-
+    stats();
     update_current_screen();
 
     screen[current_screen].set_backend(backend);
@@ -146,9 +234,81 @@ void AP_OSD::update_osd()
     backend->flush();
 }
 
+//update maximums and totals
+void AP_OSD::stats()
+{
+    uint32_t now = AP_HAL::millis();
+    if (!AP_Notify::flags.armed) {
+        last_update_ms = now;
+        return;
+    }
+
+    // flight distance     
+    uint32_t delta_ms = now - last_update_ms;
+    last_update_ms = now;
+    
+    AP_AHRS &ahrs = AP::ahrs();
+    Vector2f v = ahrs.groundspeed_vector();
+    float speed = v.length();
+    if (speed < 2.0) {
+        speed = 0.0;
+    }
+    float dist_m = (speed * delta_ms)*0.001;
+    last_distance_m += dist_m;
+    
+    // maximum ground speed
+    max_speed_mps = fmaxf(max_speed_mps,speed);
+    
+    // maximum distance
+    Location loc;
+    if (ahrs.get_position(loc) && ahrs.home_is_set()) {
+        const Location &home_loc = ahrs.get_home();
+        float distance = home_loc.get_distance(loc);
+        max_dist_m = fmaxf(max_dist_m, distance);
+    }
+    
+    // maximum altitude
+    float alt;
+    AP::ahrs().get_relative_position_D_home(alt);
+    alt = -alt;
+    max_alt_m = fmaxf(max_alt_m, alt);
+    // maximum current
+    AP_BattMonitor &battery = AP::battery();
+    float amps = battery.current_amps();
+    max_current_a = fmaxf(max_current_a, amps);
+}
+
+
 //Thanks to minimosd authors for the multiple osd screen idea
 void AP_OSD::update_current_screen()
 {
+    // Switch on ARM/DISARM event
+    if (AP_Notify::flags.armed){
+        if (!was_armed && arm_scr > 0 && arm_scr <= AP_OSD_NUM_SCREENS && screen[arm_scr-1].enabled){
+            current_screen = arm_scr-1;
+        }
+        was_armed = true;
+    } else if (was_armed) {
+        if (disarm_scr > 0 && disarm_scr <= AP_OSD_NUM_SCREENS && screen[disarm_scr-1].enabled){
+            current_screen = disarm_scr-1;
+        } 
+        was_armed = false;
+    }
+    
+    // Switch on failsafe event
+    if (AP_Notify::flags.failsafe_radio || AP_Notify::flags.failsafe_battery) {
+        if (!was_failsafe && failsafe_scr > 0 && failsafe_scr <= AP_OSD_NUM_SCREENS && screen[failsafe_scr-1].enabled){
+            pre_fs_screen = current_screen;
+            current_screen = failsafe_scr-1;
+        }
+        was_failsafe = true;
+    } else if (was_failsafe) {
+        if (screen[pre_fs_screen].enabled){
+            current_screen = pre_fs_screen;
+        } 
+        was_failsafe = false;
+    }
+    
     if (rc_channel == 0) {
         return;
     }
@@ -180,8 +340,8 @@ void AP_OSD::update_current_screen()
     //select screen based on pwm ranges specified
     case PWM_RANGE:
         for (int i=0; i<AP_OSD_NUM_SCREENS; i++) {
-            if (screen[i].enabled && screen[i].channel_min <= channel_value && screen[i].channel_max > channel_value) {
-                current_screen = i;
+            if (screen[i].enabled && screen[i].channel_min <= channel_value && screen[i].channel_max > channel_value && previous_pwm_screen != i) {
+                current_screen = previous_pwm_screen = i;
                 break;
             }
         }
@@ -217,3 +377,9 @@ void AP_OSD::next_screen()
     current_screen = t;
 }
 
+// set navigation information for display
+void AP_OSD::set_nav_info(NavInfo &navinfo)
+{
+    // do this without a lock for now
+    nav_info = navinfo;
+}
